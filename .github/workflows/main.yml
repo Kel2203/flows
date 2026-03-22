@@ -2,9 +2,8 @@ name: Scraper Imóveis → Databricks
 
 on:
   schedule:
-    # 4x por dia: 07h, 13h, 18h, 23h (horário de Brasília = UTC-3)
     - cron: "0 10,16,21,2 * * *"
-  workflow_dispatch:  # permite rodar manualmente pelo GitHub UI
+  workflow_dispatch:
 
 jobs:
   scraper:
@@ -12,7 +11,7 @@ jobs:
     timeout-minutes: 30
 
     env:
-      MAX_IMOVEIS:      "50"
+      MAX_LINKS:        "20"
       DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
       WAREHOUSE_ID:     ${{ secrets.WAREHOUSE_ID }}
@@ -29,25 +28,41 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 📦 Instalar dependências
-        run: pip install requests
+      - name: 📦 Instalar dependências Python
+        run: pip install requests playwright
+
+      - name: 🌐 Instalar navegador Chromium
+        run: playwright install chromium --with-deps
 
       - name: 🔍 Rodar scraper
         run: python scraper_local.py
 
       - name: 📊 Verificar CSV gerado
+        id: check_csv
         run: |
-          echo "Linhas coletadas:"
-          wc -l imoveis.csv || echo "Arquivo não gerado"
-          head -3 imoveis.csv || true
+          if [ -f imoveis.csv ]; then
+            LINHAS=$(wc -l < imoveis.csv)
+            echo "✅ CSV gerado com $LINHAS linhas"
+            head -3 imoveis.csv
+            echo "csv_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ CSV não gerado"
+            echo "csv_exists=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: 📤 Upload para Databricks
+        if: steps.check_csv.outputs.csv_exists == 'true'
         run: python upload_databricks.py
 
-      - name: 🗂️ Salvar CSV como artefato (debug)
+      - name: ⚠️ Avisar se sem dados
+        if: steps.check_csv.outputs.csv_exists == 'false'
+        run: echo "::warning::Scraper não coletou dados nesta rodada"
+
+      - name: 🗂️ Salvar CSV como artefato
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: imoveis-${{ github.run_id }}
           path: imoveis.csv
+          if-no-files-found: ignore
           retention-days: 3
