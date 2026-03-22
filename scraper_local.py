@@ -12,7 +12,6 @@ import os
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# ── Configuração ──────────────────────────────────────────────
 MAX_LINKS   = int(os.environ.get("MAX_LINKS", 20))
 OUTPUT_FILE = os.environ.get("CSV_FILE", "imoveis.csv")
 
@@ -20,8 +19,6 @@ LIST_URL = (
     "https://www.olx.com.br/imoveis/venda/estado-sp/sao-paulo-e-regiao"
     "?pe=400000&sf=1&coe=1000&ipe=500&ss=30"
 )
-
-# ── Funções de extração ───────────────────────────────────────
 
 def extrair_preco(texto: str) -> float:
     match = re.search(r"R\$\s*[\d.,]+", texto)
@@ -46,10 +43,23 @@ def extrair_endereco(texto: str) -> str:
         return m.group(1).strip()
     return ""
 
-# ── Scraper principal ─────────────────────────────────────────
+def is_bloqueado(titulo: str, preco: float) -> bool:
+    titulo_lower = titulo.lower()
+    return (
+        "sorry" in titulo_lower or
+        "blocked" in titulo_lower or
+        "opt out" in titulo_lower or
+        "personal informa" in titulo_lower or
+        preco == 0.0
+    )
 
 def coletar_links(page, max_links: int) -> list[str]:
     print("🌐 Acessando OLX...")
+
+    # Warm-up na página inicial para pegar cookies
+    page.goto("https://www.olx.com.br", wait_until="domcontentloaded", timeout=30000)
+    time.sleep(random.uniform(2.0, 3.5))
+
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
 
     print("⏳ Aguardando anúncios...")
@@ -63,15 +73,24 @@ def coletar_links(page, max_links: int) -> list[str]:
         "els => els.map(el => el.href)"
     )
 
-    links = list(dict.fromkeys(links))[:max_links]  # dedup + limite
+    links = list(dict.fromkeys(links))[:max_links]
     print(f"📦 {len(links)} links coletados")
     return links
 
 
 def scrape_anuncio(page, link: str) -> dict | None:
     try:
-        time.sleep(random.uniform(1.5, 3.0))
+        # Delay aleatório maior entre anúncios para parecer humano
+        time.sleep(random.uniform(3.0, 6.0))
+
         page.goto(link, wait_until="domcontentloaded", timeout=45000)
+
+        # Aguarda o corpo carregar
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except PlaywrightTimeout:
+            pass
+
         texto = page.inner_text("body") or ""
 
         # Título
@@ -85,7 +104,12 @@ def scrape_anuncio(page, link: str) -> dict | None:
                 "() => document.querySelector('meta[property=\"og:title\"]')?.content || document.title || ''"
             )
 
-        # Preço atual
+        # Checar bloqueio antes de continuar
+        preco_inicial = extrair_preco(texto)
+        if is_bloqueado(titulo, preco_inicial):
+            return None
+
+        # Preço
         preco = 0.0
         try:
             preco_el = page.query_selector("h3.olx-adcard__price, h3[class*=price], .olx-price, .price")
@@ -94,7 +118,7 @@ def scrape_anuncio(page, link: str) -> dict | None:
         except Exception:
             pass
         if not preco:
-            preco = extrair_preco(texto)
+            preco = preco_inicial
 
         # Preço anterior
         preco_anterior = 0.0
@@ -105,7 +129,7 @@ def scrape_anuncio(page, link: str) -> dict | None:
         except Exception:
             pass
 
-        # Endereço via elemento de localização
+        # Endereço
         endereco = ""
         try:
             loc_el = page.query_selector("p.olx-adcard__location, .olx-adcard__location, .location")
@@ -122,7 +146,6 @@ def scrape_anuncio(page, link: str) -> dict | None:
             pass
         if not endereco:
             endereco = extrair_endereco(texto)
-
         if endereco and "são paulo" not in endereco.lower():
             endereco = f"{endereco}, São Paulo"
 
@@ -176,36 +199,41 @@ def main():
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             locale="pt-BR",
+            viewport={"width": 1280, "height": 800},
         )
 
-        # Bloquear recursos pesados para acelerar
+        # Bloquear recursos pesados
         def bloquear(route):
             if route.request.resource_type in ["image", "stylesheet", "font", "media"]:
                 route.abort()
             else:
                 route.continue_()
-
         context.route("**/*", bloquear)
 
-        # Página de listagem
+        # Listagem
         page_lista = context.new_page()
         links = coletar_links(page_lista, MAX_LINKS)
         page_lista.close()
 
-        # Scraping individual
+        # Anúncios individuais
         anuncios = []
+        bloqueados = 0
         for i, link in enumerate(links, 1):
             print(f"\n  [{i}/{len(links)}] {link[:80]}")
             page = context.new_page()
             dados = scrape_anuncio(page, link)
             page.close()
+
             if dados:
                 anuncios.append(dados)
                 print(f"    ✅ {dados['titulo'][:50]} | R${dados['preco']} | {dados['area']}m² | {dados['quartos']}q")
+            else:
+                bloqueados += 1
+                print(f"    ⛔ Bloqueado ou sem dados — pulando ({bloqueados} até agora)")
 
         browser.close()
 
-    print(f"\n✅ Total extraído: {len(anuncios)} anúncios")
+    print(f"\n✅ Total extraído: {len(anuncios)} | Bloqueados: {bloqueados}")
     salvar_csv(anuncios, OUTPUT_FILE)
 
 
