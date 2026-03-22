@@ -1,1 +1,55 @@
 
+name: Scraper Imóveis OLX → Databricks
+
+on:
+  schedule:
+    # 4x por dia: 07h, 13h, 18h, 23h (horário de Brasília = UTC-3)
+    - cron: "0 10,16,21,2 * * *"
+  workflow_dispatch:  # permite rodar manualmente pelo GitHub UI
+
+jobs:
+  scraper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      MAX_IMOVEIS:      "50"
+      DATABRICKS_HOST:  ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      WAREHOUSE_ID:     ${{ secrets.WAREHOUSE_ID }}
+      CATALOG:          "workspace"
+      SCHEMA:           "imoveis"
+      CSV_FILE:         "imoveis.csv"
+
+    steps:
+      - name: 📥 Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 Instalar dependências
+        run: pip install requests
+
+      - name: 🔍 Rodar scraper
+        run: python scraper_local.py
+
+      - name: 📊 Verificar CSV gerado
+        run: |
+          echo "Linhas coletadas:"
+          wc -l imoveis.csv || echo "Arquivo não gerado"
+          head -3 imoveis.csv || true
+
+      - name: 📤 Upload para Databricks
+        run: python upload_databricks.py
+
+      - name: 🗂️ Salvar CSV como artefato (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imoveis-${{ github.run_id }}
+          path: imoveis.csv
+          retention-days: 3
