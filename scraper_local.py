@@ -1,175 +1,213 @@
 """
 scraper_local.py
-Roda no GitHub Actions — coleta imóveis do VivaReal e salva em imoveis.csv
+Usa Playwright (equivalente Python do Puppeteer) para scraping da OLX.
+Roda no GitHub Actions com Chrome real — contorna o Cloudflare.
 """
 
-import requests
+import re
 import time
 import random
 import csv
 import os
 from datetime import datetime
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ── Configuração ──────────────────────────────────────────────
-MAX_IMOVEIS = int(os.environ.get("MAX_IMOVEIS", 50))
-OUTPUT_FILE = "imoveis.csv"
+MAX_LINKS   = int(os.environ.get("MAX_LINKS", 20))
+OUTPUT_FILE = os.environ.get("CSV_FILE", "imoveis.csv")
 
-VIVAREAL_API = "https://glue-api.vivareal.com/v2/listings"
+LIST_URL = (
+    "https://www.olx.com.br/imoveis/venda/estado-sp/sao-paulo-e-regiao"
+    "?pe=400000&sf=1&coe=1000&ipe=500&ss=30"
+)
 
-PARAMS_BASE = {
-    "addressCity":    "São Paulo",
-    "addressState":   "São Paulo",
-    "addressCountry": "Brasil",
-    "business":       "SALE",
-    "unitTypes":      "APARTMENT",
-    "unitSubTypes":   "UnitSubType_NONE,APARTMENT,PENTHOUSE,FLAT",
-    "priceMax":       400000,
-    "areaMin":        30,
-    "bedrooms":       "1,2,3,4",
-    "listingType":    "USED",
-    "parentId":       "null",
-    "categoryPage":   "RESULT",
-    "size":           24,
-    "from":           0,
-    "q":              "",
-    "sort":           "publicationDate",
-    "sortOrder":      "DESC",
-}
+# ── Funções de extração ───────────────────────────────────────
 
-# ── Sessão com cookies ────────────────────────────────────────
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":             "application/json, text/plain, */*",
-    "Accept-Language":    "pt-BR,pt;q=0.9",
-    "Origin":             "https://www.vivareal.com.br",
-    "Referer":            "https://www.vivareal.com.br/venda/sp/sao-paulo/apartamento_residencial/",
-    "X-Domain":           "www.vivareal.com.br",
-    "sec-ch-ua":          '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    "sec-ch-ua-mobile":   "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest":     "empty",
-    "Sec-Fetch-Mode":     "cors",
-    "Sec-Fetch-Site":     "same-site",
-})
+def extrair_preco(texto: str) -> float:
+    match = re.search(r"R\$\s*[\d.,]+", texto)
+    return float(re.sub(r"[^\d]", "", match.group(0))) if match else 0.0
 
+def extrair_area(texto: str) -> float:
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", texto)
+    return float(match.group(1).replace(",", ".")) if match else 0.0
 
-def aquecer_sessao():
-    print("🌐 Aquecendo sessão...")
-    SESSION.get("https://www.vivareal.com.br", timeout=20)
-    time.sleep(random.uniform(2.0, 4.0))
-    SESSION.get(
-        "https://www.vivareal.com.br/venda/sp/sao-paulo/apartamento_residencial/",
-        timeout=20
+def extrair_quartos(texto: str) -> int:
+    match = re.search(
+        r"(\d+)\s*(?:quarto|dormitório|dorm|suíte|q)\s*s?", texto, re.IGNORECASE
     )
-    time.sleep(random.uniform(1.5, 3.0))
-    print(f"✅ Cookies: {list(SESSION.cookies.keys())}")
+    return int(match.group(1)) if match else 0
 
+def extrair_endereco(texto: str) -> str:
+    m = re.search(r"([A-Za-záéíóúàãõâêôÁÉÍÓÚÀÃÕÂÊÔ\s]+),\s*São Paulo", texto, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"São Paulo[,\-]\s*([A-Za-záéíóúàãõâêôÁÉÍÓÚÀÃÕÂÊÔ\s]+)", texto, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
 
-def extrair_imovel(listing: dict) -> dict | None:
+# ── Scraper principal ─────────────────────────────────────────
+
+def coletar_links(page, max_links: int) -> list[str]:
+    print("🌐 Acessando OLX...")
+    page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
+
+    print("⏳ Aguardando anúncios...")
     try:
-        ld     = listing.get("listing", {})
-        prices = ld.get("pricingInfos", [{}])
-        preco  = 0.0
-        for p in prices:
-            if p.get("businessType") == "SALE":
-                preco = float(p.get("price", 0) or 0)
-                break
+        page.wait_for_selector('a[data-testid="adcard-link"]', timeout=90000)
+    except PlaywrightTimeout:
+        print("⚠️ Timeout aguardando seletor, tentando mesmo assim...")
 
-        area    = float((ld.get("usableAreas") or ld.get("totalAreas") or [0])[0] or 0)
-        quartos = int((ld.get("bedrooms") or [0])[0] or 0)
+    links = page.eval_on_selector_all(
+        'a[data-testid="adcard-link"]',
+        "els => els.map(el => el.href)"
+    )
 
-        loc      = ld.get("address", {})
-        bairro   = loc.get("neighborhood", "")
-        cidade   = loc.get("city", "São Paulo")
-        estado   = loc.get("stateAcronym", "SP")
-        endereco = f"{bairro}, {cidade} - {estado}".strip(", ")
+    links = list(dict.fromkeys(links))[:max_links]  # dedup + limite
+    print(f"📦 {len(links)} links coletados")
+    return links
 
-        titulo    = ld.get("title", "") or ""
-        descricao = (ld.get("description", "") or "")[:2000]
-        slug      = ld.get("slug", ld.get("id", ""))
-        link      = f"https://www.vivareal.com.br/imovel/{slug}/"
+
+def scrape_anuncio(page, link: str) -> dict | None:
+    try:
+        time.sleep(random.uniform(1.5, 3.0))
+        page.goto(link, wait_until="domcontentloaded", timeout=45000)
+        texto = page.inner_text("body") or ""
+
+        # Título
+        titulo = ""
+        try:
+            titulo = page.inner_text("h1").strip()
+        except Exception:
+            pass
+        if not titulo:
+            titulo = page.evaluate(
+                "() => document.querySelector('meta[property=\"og:title\"]')?.content || document.title || ''"
+            )
+
+        # Preço atual
+        preco = 0.0
+        try:
+            preco_el = page.query_selector("h3.olx-adcard__price, h3[class*=price], .olx-price, .price")
+            if preco_el:
+                preco = extrair_preco(preco_el.inner_text())
+        except Exception:
+            pass
+        if not preco:
+            preco = extrair_preco(texto)
+
+        # Preço anterior
+        preco_anterior = 0.0
+        try:
+            old_el = page.query_selector("p.olx-adcard__old-price, .old-price, .price-old")
+            if old_el:
+                preco_anterior = extrair_preco(old_el.inner_text())
+        except Exception:
+            pass
+
+        # Endereço via elemento de localização
+        endereco = ""
+        try:
+            loc_el = page.query_selector("p.olx-adcard__location, .olx-adcard__location, .location")
+            if loc_el:
+                loc_text = loc_el.inner_text().strip()
+                m = re.search(r"([A-Za-záéíóúàãõâêô\s]+),\s*São Paulo", loc_text, re.IGNORECASE)
+                if m:
+                    endereco = m.group(1).strip()
+                else:
+                    m = re.search(r"São Paulo[,\-]\s*([A-Za-záéíóúàãõâêô\s]+)", loc_text, re.IGNORECASE)
+                    if m:
+                        endereco = m.group(1).strip()
+        except Exception:
+            pass
+        if not endereco:
+            endereco = extrair_endereco(texto)
+
+        if endereco and "são paulo" not in endereco.lower():
+            endereco = f"{endereco}, São Paulo"
+
+        area    = extrair_area(texto)
+        quartos = extrair_quartos(texto)
 
         return {
             "link":           link,
-            "fonte":          "vivareal",
+            "fonte":          "olx",
             "titulo":         titulo,
             "endereco":       endereco,
-            "descricao":      descricao,
+            "descricao":      texto[:2000],
             "preco":          preco,
-            "preco_anterior": 0.0,
+            "preco_anterior": preco_anterior,
             "area":           area,
             "quartos":        quartos,
             "scraped_at":     datetime.utcnow().isoformat(),
         }
     except Exception as e:
-        print(f"  ⚠️ Erro ao extrair: {e}")
+        print(f"  ❌ Erro em {link[:60]}: {e}")
         return None
-
-
-def coletar_imoveis(max_imoveis: int) -> list[dict]:
-    imoveis = []
-    pagina  = 0
-
-    while len(imoveis) < max_imoveis:
-        params = {**PARAMS_BASE, "from": pagina * PARAMS_BASE["size"]}
-        print(f"📄 Página {pagina + 1}...")
-
-        try:
-            resp = SESSION.get(VIVAREAL_API, params=params, timeout=30)
-            print(f"  HTTP {resp.status_code}")
-
-            if resp.status_code != 200:
-                print(f"  ❌ Bloqueado: {resp.status_code}")
-                break
-
-            listings = (
-                resp.json()
-                    .get("search", {})
-                    .get("result", {})
-                    .get("listings", [])
-            )
-
-            if not listings:
-                print("  ℹ️ Sem mais resultados.")
-                break
-
-            for listing in listings:
-                imovel = extrair_imovel(listing)
-                if imovel:
-                    imoveis.append(imovel)
-                if len(imoveis) >= max_imoveis:
-                    break
-
-            print(f"  ✅ {len(imoveis)} coletados")
-            pagina += 1
-            time.sleep(random.uniform(1.5, 3.0))
-
-        except Exception as e:
-            print(f"  ❌ Erro: {e}")
-            break
-
-    return imoveis
 
 
 def salvar_csv(imoveis: list[dict], path: str):
     if not imoveis:
         print("⚠️ Nenhum imóvel para salvar.")
         return
-
     campos = ["link", "fonte", "titulo", "endereco", "descricao",
               "preco", "preco_anterior", "area", "quartos", "scraped_at"]
-
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=campos)
         writer.writeheader()
         writer.writerows(imoveis)
-
     print(f"💾 {len(imoveis)} imóveis salvos em {path}")
 
 
+def main():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+            ]
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="pt-BR",
+        )
+
+        # Bloquear recursos pesados para acelerar
+        def bloquear(route):
+            if route.request.resource_type in ["image", "stylesheet", "font", "media"]:
+                route.abort()
+            else:
+                route.continue_()
+
+        context.route("**/*", bloquear)
+
+        # Página de listagem
+        page_lista = context.new_page()
+        links = coletar_links(page_lista, MAX_LINKS)
+        page_lista.close()
+
+        # Scraping individual
+        anuncios = []
+        for i, link in enumerate(links, 1):
+            print(f"\n  [{i}/{len(links)}] {link[:80]}")
+            page = context.new_page()
+            dados = scrape_anuncio(page, link)
+            page.close()
+            if dados:
+                anuncios.append(dados)
+                print(f"    ✅ {dados['titulo'][:50]} | R${dados['preco']} | {dados['area']}m² | {dados['quartos']}q")
+
+        browser.close()
+
+    print(f"\n✅ Total extraído: {len(anuncios)} anúncios")
+    salvar_csv(anuncios, OUTPUT_FILE)
+
+
 if __name__ == "__main__":
-    aquecer_sessao()
-    imoveis = coletar_imoveis(MAX_IMOVEIS)
-    salvar_csv(imoveis, OUTPUT_FILE)
-    print(f"\n✅ Scraping concluído: {len(imoveis)} imóveis")
+    main()
