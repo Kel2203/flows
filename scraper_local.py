@@ -1,15 +1,16 @@
 """
 scraper_local.py
-Usa Playwright para scraping da OLX com técnicas anti-detecção.
-Roda no GitHub Actions — extrai dados da listagem + detalhes quando possível.
+Extrai dados diretamente da página de listagem da OLX (sem abrir anúncios individuais),
+já que o OLX bloqueia 100% das páginas individuais em ambientes de CI/datacenter.
+Os dados da listagem (título, preço, área, quartos, endereço) são suficientes.
 """
 
 import re
 import time
 import random
-import json
 import csv
 import os
+import json
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -21,11 +22,29 @@ LIST_URL = (
     "?pe=400000&sf=1&coe=1000&ipe=500&ss=30"
 )
 
+# Script de evasão de fingerprint - injeta em todas as páginas
+STEALTH_JS = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
+    window.chrome = { runtime: {} };
+    const orig = window.navigator.permissions.query;
+    window.navigator.permissions.query = (p) =>
+        p.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : orig(p);
+}
+"""
+
 # ── Helpers de extração ──────────────────────────────────────────────────────
 
 def extrair_preco(texto: str) -> float:
+    """Extrai o primeiro valor R$ encontrado no texto."""
     match = re.search(r"R\$\s*[\d.,]+", texto)
-    return float(re.sub(r"[^\d]", "", match.group(0))) if match else 0.0
+    if not match:
+        return 0.0
+    return float(re.sub(r"[^\d]", "", match.group(0)))
 
 def extrair_area(texto: str) -> float:
     match = re.search(r"(\d+(?:[.,]\d+)?)\s*m²", texto)
@@ -37,7 +56,33 @@ def extrair_quartos(texto: str) -> int:
     )
     return int(match.group(1)) if match else 0
 
-def extrair_endereco(texto: str) -> str:
+def extrair_quartos_titulo(titulo: str) -> int:
+    """Extrai quartos de padrões comuns no título: '2 dorm', '3 qtos', etc."""
+    padroes = [
+        r"(\d+)\s*(?:dorm|quarto|qto|suíte)",
+        r"(\d+)\s*(?:dormitório|dormitorios)",
+    ]
+    for p in padroes:
+        m = re.search(p, titulo, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return 0
+
+def extrair_area_titulo(titulo: str) -> float:
+    """Extrai área de padrões como '44m²', '44 m2', '44metros' no título."""
+    padroes = [
+        r"(\d+(?:[.,]\d+)?)\s*m²",
+        r"(\d+(?:[.,]\d+)?)\s*m2",
+        r"(\d+(?:[.,]\d+)?)\s*metros",
+        r"com\s+(\d+)\s*m",
+    ]
+    for p in padroes:
+        m = re.search(p, titulo, re.IGNORECASE)
+        if m:
+            return float(m.group(1).replace(",", "."))
+    return 0.0
+
+def extrair_endereco_texto(texto: str) -> str:
     m = re.search(r"([A-Za-záéíóúàãõâêôÁÉÍÓÚÀÃÕÂÊÔ\s]+),\s*São Paulo", texto, re.IGNORECASE)
     if m:
         return m.group(1).strip()
@@ -53,270 +98,328 @@ def normalizar_endereco(endereco: str) -> str:
         return f"{endereco}, São Paulo"
     return endereco
 
-def is_pagina_bloqueada(titulo: str, texto_body: str) -> bool:
-    """Detecta páginas de bloqueio/CAPTCHA do Cloudflare ou OLX."""
-    titulo_lower = titulo.lower()
-    texto_lower  = texto_body[:500].lower()
-    sinais = [
-        "sorry", "blocked", "opt out", "personal informa",
-        "just a moment", "checking your browser", "enable javascript",
-        "cf-browser-verification", "captcha", "403 forbidden",
-        "access denied", "ray id"
-    ]
-    return any(s in titulo_lower or s in texto_lower for s in sinais)
+# ── Extração da listagem ─────────────────────────────────────────────────────
 
-# ── Script de evasão de fingerprint ─────────────────────────────────────────
+def debug_pagina(page) -> None:
+    """Imprime diagnóstico da página atual para facilitar ajuste de seletores."""
+    titulo = page.title()
+    url    = page.url
+    print(f"  [DEBUG] URL: {url}")
+    print(f"  [DEBUG] Título: {titulo}")
+    # Conta quantos links de anúncio existem com diferentes seletores
+    for sel in ['a[data-testid="adcard-link"]', 'li[data-lurker-detail]', 'section li a']:
+        try:
+            count = page.eval_on_selector_all(sel, "els => els.length")
+            print(f"  [DEBUG] seletor '{sel}': {count} elementos")
+        except Exception:
+            print(f"  [DEBUG] seletor '{sel}': erro")
 
-STEALTH_JS = """
-() => {
-    // Ocultar webdriver
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-    // Plugins realistas
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => [1, 2, 3, 4, 5],
-    });
-
-    // Linguagens
-    Object.defineProperty(navigator, 'languages', {
-        get: () => ['pt-BR', 'pt', 'en-US', 'en'],
-    });
-
-    // Permissões não automatizadas
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications'
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(parameters)
-    );
-
-    // Chrome runtime fake
-    window.chrome = { runtime: {} };
-
-    // Ocultar headless via user agent
-    Object.defineProperty(navigator, 'userAgent', {
-        get: () => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    });
-}
-"""
-
-# ── Coleta de links + dados básicos da listagem ──────────────────────────────
 
 def coletar_da_listagem(page, max_links: int) -> list[dict]:
     """
-    Coleta links e dados básicos (título, preço, endereço, área) diretamente
-    da página de listagem, sem precisar abrir cada anúncio.
+    Coleta dados diretamente da listagem sem abrir páginas individuais.
+    Estratégia em camadas:
+      1. JS direto nos cards (mais dados estruturados)
+      2. Fallback: extrair do JSON do __NEXT_DATA__ (dados do Next.js)
+      3. Fallback: regex no HTML bruto
     """
+
+    # ── Warm-up humano ───────────────────────────────────────────────────────
     print("🌐 Warm-up na home do OLX...")
     page.goto("https://www.olx.com.br", wait_until="domcontentloaded", timeout=30000)
     time.sleep(random.uniform(2.5, 4.0))
+    page.mouse.move(random.randint(200, 900), random.randint(100, 500))
+    time.sleep(random.uniform(0.8, 1.5))
 
-    # Simular comportamento humano: scroll suave
-    page.mouse.move(random.randint(100, 800), random.randint(100, 400))
-    time.sleep(random.uniform(0.5, 1.2))
-
+    # ── Página de listagem ───────────────────────────────────────────────────
     print("🔍 Acessando página de listagem...")
     page.goto(LIST_URL, wait_until="domcontentloaded", timeout=60000)
 
     print("⏳ Aguardando anúncios...")
+    seletor_principal = 'a[data-testid="adcard-link"]'
     try:
-        page.wait_for_selector('a[data-testid="adcard-link"]', timeout=90000)
+        page.wait_for_selector(seletor_principal, timeout=90000)
     except PlaywrightTimeout:
-        print("⚠️ Timeout aguardando seletor principal, tentando seletores alternativos...")
-        try:
-            page.wait_for_selector('section[data-lurker-detail="ad_list"] li', timeout=15000)
-        except PlaywrightTimeout:
-            print("⚠️ Nenhum seletor encontrado, prosseguindo mesmo assim...")
+        print("⚠️ Timeout no seletor principal")
 
-    # Scroll para carregar mais anúncios
-    for _ in range(3):
+    # Scroll para garantir que todos os cards carregaram
+    for _ in range(4):
         page.keyboard.press("End")
-        time.sleep(random.uniform(0.8, 1.5))
+        time.sleep(random.uniform(0.6, 1.2))
+    page.keyboard.press("Home")
+    time.sleep(1.0)
 
-    # Tentar extrair dados estruturados diretamente da listagem
-    imoveis_da_lista = page.evaluate("""
-    () => {
-        const cards = document.querySelectorAll('li[data-lurker-detail], section li');
-        const resultado = [];
+    debug_pagina(page)
 
-        document.querySelectorAll('a[data-testid="adcard-link"]').forEach(a => {
-            try {
-                const card = a.closest('li') || a.parentElement;
-                const texto = card ? card.innerText : '';
+    # ── Estratégia 1: __NEXT_DATA__ (JSON embutido pelo Next.js) ─────────────
+    imoveis = _extrair_next_data(page)
+    if imoveis:
+        print(f"✅ {len(imoveis)} anúncios extraídos via __NEXT_DATA__")
+        return imoveis[:max_links]
 
-                // Preço
-                let preco = 0;
-                const precoEl = card && card.querySelector('h3, [class*=price], [class*=Price]');
-                if (precoEl) {
-                    const m = precoEl.innerText.match(/R\\$\\s*[\\d.,]+/);
-                    if (m) preco = Number(m[0].replace(/\\D/g, ''));
-                }
-                if (!preco) {
-                    const m = texto.match(/R\\$\\s*[\\d.,]+/);
-                    if (m) preco = Number(m[0].replace(/\\D/g, ''));
-                }
+    # ── Estratégia 2: JS direto nos cards ────────────────────────────────────
+    imoveis = _extrair_via_js(page)
+    if imoveis:
+        print(f"✅ {len(imoveis)} anúncios extraídos via JS nos cards")
+        return imoveis[:max_links]
 
-                // Título
-                let titulo = a.getAttribute('aria-label') || '';
-                if (!titulo) {
-                    const h2 = card && card.querySelector('h2, h3');
-                    titulo = h2 ? h2.innerText.trim() : '';
-                }
+    # ── Estratégia 3: Regex no HTML bruto ────────────────────────────────────
+    imoveis = _extrair_via_regex(page)
+    if imoveis:
+        print(f"✅ {len(imoveis)} anúncios extraídos via regex no HTML")
+        return imoveis[:max_links]
 
-                // Endereço
-                let endereco = '';
-                const locEl = card && card.querySelector('[class*=location], [class*=Location]');
-                if (locEl) endereco = locEl.innerText.trim();
-
-                // Área e quartos do título/texto
-                const areaM = texto.match(/(\\d+(?:[.,]\\d+)?)\\s*m²/);
-                const area = areaM ? parseFloat(areaM[1].replace(',', '.')) : 0;
-
-                const qtM = texto.match(/(\\d+)\\s*(?:quarto|dorm|suíte)/i);
-                const quartos = qtM ? parseInt(qtM[1]) : 0;
-
-                resultado.push({
-                    link: a.href,
-                    titulo: titulo.trim(),
-                    preco,
-                    endereco: endereco.trim(),
-                    area,
-                    quartos,
-                });
-            } catch(e) {}
-        });
-
-        return resultado;
-    }
-    """)
-
-    # Deduplica por link
-    vistos = set()
-    unicos = []
-    for item in imoveis_da_lista:
-        link = item.get("link", "")
-        if link and link not in vistos:
-            vistos.add(link)
-            unicos.append(item)
-
-    print(f"📦 {len(unicos)} anúncios coletados da listagem")
-    return unicos[:max_links]
+    print("❌ Nenhuma estratégia funcionou.")
+    return []
 
 
-# ── Enriquecimento via página individual ────────────────────────────────────
-
-def enriquecer_anuncio(page, item: dict) -> dict | None:
-    """
-    Tenta abrir a página do anúncio para pegar dados que faltam.
-    Se bloqueado, retorna o que já temos da listagem (se tiver preço).
-    """
-    link = item.get("link", "")
-    if not link:
-        return None
-
-    # Se já temos dados suficientes da listagem, não precisa abrir
-    tem_dados_basicos = (
-        item.get("preco", 0) > 0 and
-        item.get("titulo") and
-        item.get("area", 0) > 0
-    )
-
+def _extrair_next_data(page) -> list[dict]:
+    """Extrai anúncios do JSON __NEXT_DATA__ embutido pelo Next.js."""
     try:
-        time.sleep(random.uniform(2.0, 4.5))
-        page.goto(link, wait_until="domcontentloaded", timeout=45000)
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except PlaywrightTimeout:
-            pass
-
-        titulo_page = ""
-        try:
-            titulo_page = page.inner_text("h1").strip()
-        except Exception:
-            pass
-        if not titulo_page:
-            titulo_page = page.evaluate(
-                "() => document.querySelector('meta[property=\"og:title\"]')?.content || document.title || ''"
-            )
-
-        texto = page.inner_text("body") or ""
-
-        # Verificar bloqueio
-        if is_pagina_bloqueada(titulo_page, texto):
-            print(f"    ⚠️ Bloqueado na página individual — usando dados da listagem")
-            if tem_dados_basicos:
-                return _montar_registro(item, item.get("titulo", ""), texto="")
-            return None
-
-        # Enriquecer com dados da página
-        preco = 0.0
-        try:
-            preco_el = page.query_selector("h3[class*=price], [class*=Price], .olx-price, .price")
-            if preco_el:
-                preco = extrair_preco(preco_el.inner_text())
-        except Exception:
-            pass
-        if not preco:
-            preco = extrair_preco(texto)
-
-        preco_anterior = 0.0
-        try:
-            old_el = page.query_selector("[class*=old-price], [class*=oldPrice], .old-price")
-            if old_el:
-                preco_anterior = extrair_preco(old_el.inner_text())
-        except Exception:
-            pass
-
-        endereco = ""
-        try:
-            loc_el = page.query_selector("[class*=location], [class*=Location], [data-testid*=location]")
-            if loc_el:
-                loc_text = loc_el.inner_text().strip()
-                endereco = extrair_endereco(loc_text) or loc_text
-        except Exception:
-            pass
-        if not endereco:
-            endereco = extrair_endereco(texto)
-
-        area    = extrair_area(texto) or item.get("area", 0)
-        quartos = extrair_quartos(texto) or item.get("quartos", 0)
-
-        enriquecido = {
-            "link":           link,
-            "titulo":         titulo_page or item.get("titulo", ""),
-            "preco":          preco or item.get("preco", 0),
-            "preco_anterior": preco_anterior,
-            "endereco":       endereco or item.get("endereco", ""),
-            "area":           area,
-            "quartos":        quartos,
+        raw = page.evaluate("""
+        () => {
+            const el = document.getElementById('__NEXT_DATA__');
+            return el ? el.textContent : null;
         }
-        return _montar_registro(enriquecido, enriquecido["titulo"], texto)
+        """)
+        if not raw:
+            return []
+
+        data = json.loads(raw)
+
+        # Navegar pela estrutura do Next.js para achar os anúncios
+        # A estrutura pode variar; tentamos caminhos comuns
+        ads = []
+        def buscar_lista(obj, depth=0):
+            if depth > 8 or not isinstance(obj, (dict, list)):
+                return
+            if isinstance(obj, list):
+                # Lista com dicts que têm 'url' e 'price' = provavelmente anúncios
+                if obj and isinstance(obj[0], dict) and ('url' in obj[0] or 'link' in obj[0]):
+                    ads.extend(obj)
+                    return
+                for item in obj:
+                    buscar_lista(item, depth + 1)
+            elif isinstance(obj, dict):
+                for key in ['adList', 'ads', 'listings', 'items', 'results', 'data']:
+                    if key in obj and isinstance(obj[key], list) and obj[key]:
+                        ads.extend(obj[key])
+                        return
+                for v in obj.values():
+                    buscar_lista(v, depth + 1)
+
+        buscar_lista(data)
+
+        if not ads:
+            return []
+
+        resultado = []
+        for ad in ads:
+            if not isinstance(ad, dict):
+                continue
+            link  = ad.get("url") or ad.get("link") or ad.get("href") or ""
+            if not link or "olx.com.br" not in link:
+                continue
+
+            titulo = ad.get("title") or ad.get("subject") or ""
+            preco  = 0.0
+            # Preço pode estar em sub-dicts
+            preco_raw = (
+                ad.get("price") or
+                ad.get("priceValue") or
+                (ad.get("priceInfo") or {}).get("value") or
+                ""
+            )
+            if preco_raw:
+                preco = float(re.sub(r"[^\d]", "", str(preco_raw)) or 0)
+
+            endereco_raw = (
+                ad.get("location") or
+                (ad.get("locationInfo") or {}).get("neighbourhood") or
+                ad.get("neighbourhood") or
+                ""
+            )
+            endereco = str(endereco_raw).strip() if endereco_raw else ""
+
+            # Área e quartos de propriedades do anúncio
+            area    = 0.0
+            quartos = 0
+            for prop in ad.get("properties") or []:
+                if not isinstance(prop, dict):
+                    continue
+                nome = str(prop.get("name") or prop.get("label") or "").lower()
+                val  = str(prop.get("value") or "")
+                if "area" in nome or "m²" in nome:
+                    try:
+                        area = float(re.sub(r"[^\d.,]", "", val).replace(",", ".") or 0)
+                    except Exception:
+                        pass
+                if "quarto" in nome or "dorm" in nome:
+                    try:
+                        quartos = int(re.sub(r"[^\d]", "", val) or 0)
+                    except Exception:
+                        pass
+
+            # Fallback: extrair do título
+            if not area:
+                area = extrair_area_titulo(titulo)
+            if not quartos:
+                quartos = extrair_quartos_titulo(titulo)
+
+            resultado.append({
+                "link":           link,
+                "titulo":         titulo,
+                "preco":          preco,
+                "endereco":       normalizar_endereco(endereco),
+                "area":           area,
+                "quartos":        quartos,
+                "preco_anterior": 0.0,
+            })
+
+        return resultado
 
     except Exception as e:
-        print(f"    ⚠️ Erro ao enriquecer ({e}) — usando dados da listagem")
-        if tem_dados_basicos:
-            return _montar_registro(item, item.get("titulo", ""), texto="")
-        return None
+        print(f"  [DEBUG] __NEXT_DATA__ falhou: {e}")
+        return []
 
 
-def _montar_registro(item: dict, titulo: str, texto: str) -> dict:
-    endereco = normalizar_endereco(item.get("endereco", ""))
+def _extrair_via_js(page) -> list[dict]:
+    """Extrai dados diretamente dos elementos DOM dos cards."""
+    try:
+        resultado = page.evaluate("""
+        () => {
+            const itens = [];
+            const links = document.querySelectorAll('a[data-testid="adcard-link"]');
+
+            links.forEach(a => {
+                try {
+                    const card = a.closest('li') || a.closest('section') || a.parentElement;
+                    const textoCard = card ? (card.innerText || '') : '';
+
+                    // Link
+                    const link = a.href || '';
+
+                    // Título - aria-label é mais confiável
+                    let titulo = a.getAttribute('aria-label') || '';
+                    if (!titulo) {
+                        const h = card && (card.querySelector('h2') || card.querySelector('h3'));
+                        titulo = h ? (h.innerText || '').trim() : '';
+                    }
+                    if (!titulo) titulo = (a.innerText || '').trim();
+
+                    // Preço - tentar vários seletores
+                    let preco = 0;
+                    const precoSels = [
+                        '[class*="price"],[class*="Price"]',
+                        'h3', 'strong', 'b',
+                        '[data-testid*="price"]'
+                    ];
+                    for (const sel of precoSels) {
+                        const el = card && card.querySelector(sel);
+                        if (el) {
+                            const t = el.innerText || '';
+                            const m = t.match(/R\\$\\s*[\\d.,]+/);
+                            if (m) {
+                                preco = Number(m[0].replace(/\\D/g, ''));
+                                break;
+                            }
+                        }
+                    }
+                    // Último recurso: regex no texto completo do card
+                    if (!preco) {
+                        const m = textoCard.match(/R\\$\\s*[\\d.,]+/);
+                        if (m) preco = Number(m[0].replace(/\\D/g, ''));
+                    }
+
+                    // Endereço
+                    let endereco = '';
+                    const locSels = [
+                        '[class*="location"],[class*="Location"]',
+                        '[class*="address"],[class*="Address"]',
+                        '[data-testid*="location"]',
+                        'p'
+                    ];
+                    for (const sel of locSels) {
+                        const el = card && card.querySelector(sel);
+                        if (el) {
+                            const t = (el.innerText || '').trim();
+                            if (t && t.length < 80) { endereco = t; break; }
+                        }
+                    }
+
+                    // Área e quartos do texto do card
+                    const areaM = textoCard.match(/(\\d+(?:[.,]\\d+)?)\\s*m²/);
+                    const area = areaM ? parseFloat(areaM[1].replace(',', '.')) : 0;
+
+                    const qtM = textoCard.match(/(\\d+)\\s*(?:quarto|dorm|suíte)/i);
+                    const quartos = qtM ? parseInt(qtM[1]) : 0;
+
+                    itens.push({ link, titulo: titulo.trim(), preco, endereco: endereco.trim(), area, quartos });
+                } catch(e) {}
+            });
+
+            return itens;
+        }
+        """)
+
+        # Filtrar itens sem link
+        return [i for i in (resultado or []) if i.get("link")]
+
+    except Exception as e:
+        print(f"  [DEBUG] JS nos cards falhou: {e}")
+        return []
+
+
+def _extrair_via_regex(page) -> list[dict]:
+    """Fallback: extrai links e dados básicos do HTML bruto via regex Python."""
+    try:
+        html = page.content()
+
+        links = re.findall(
+            r'href="(https://sp\.olx\.com\.br/sao-paulo-e-regiao/imoveis/[^"]+)"',
+            html
+        )
+        links = list(dict.fromkeys(links))  # dedup mantendo ordem
+
+        resultado = []
+        for link in links:
+            # Tentar pegar título da URL (slug)
+            slug = link.rstrip("/").split("/")[-1]
+            titulo = slug.replace("-", " ").title()
+
+            resultado.append({
+                "link":     link,
+                "titulo":   titulo,
+                "preco":    0.0,
+                "endereco": "São Paulo",
+                "area":     extrair_area_titulo(titulo),
+                "quartos":  extrair_quartos_titulo(titulo),
+                "preco_anterior": 0.0,
+            })
+
+        return resultado
+
+    except Exception as e:
+        print(f"  [DEBUG] Regex no HTML falhou: {e}")
+        return []
+
+
+# ── Persistência ─────────────────────────────────────────────────────────────
+
+def montar_registro(item: dict) -> dict:
     return {
         "link":           item.get("link", ""),
         "fonte":          "olx",
-        "titulo":         titulo,
-        "endereco":       endereco,
-        "descricao":      texto[:2000] if texto else "",
-        "preco":          item.get("preco", 0),
-        "preco_anterior": item.get("preco_anterior", 0),
-        "area":           item.get("area", 0),
+        "titulo":         item.get("titulo", ""),
+        "endereco":       normalizar_endereco(item.get("endereco", "")),
+        "descricao":      "",
+        "preco":          item.get("preco", 0.0),
+        "preco_anterior": item.get("preco_anterior", 0.0),
+        "area":           item.get("area", 0.0),
         "quartos":        item.get("quartos", 0),
         "scraped_at":     datetime.utcnow().isoformat(),
     }
 
-
-# ── Persistência ─────────────────────────────────────────────────────────────
 
 def salvar_csv(imoveis: list[dict], path: str):
     if not imoveis:
@@ -331,7 +434,7 @@ def salvar_csv(imoveis: list[dict], path: str):
     print(f"💾 {len(imoveis)} imóveis salvos em {path}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     with sync_playwright() as p:
@@ -342,7 +445,7 @@ def main():
                 "--disable-setuid-sandbox",
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",  # ← chave anti-detecção
+                "--disable-blink-features=AutomationControlled",
                 "--window-size=1280,800",
             ]
         )
@@ -354,23 +457,17 @@ def main():
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1280, "height": 800},
-            # Cabeçalhos que um browser real enviaria
             extra_http_headers={
                 "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Linux"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
             }
         )
-
-        # Injetar script de evasão em todas as páginas
         context.add_init_script(STEALTH_JS)
 
-        # Bloquear apenas mídia pesada (manter CSS para não parecer headless)
+        # Bloqueia apenas imagem/fonte/mídia — manter CSS para não parecer headless
         def bloquear(route):
             if route.request.resource_type in ["image", "font", "media"]:
                 route.abort()
@@ -378,51 +475,33 @@ def main():
                 route.continue_()
         context.route("**/*", bloquear)
 
-        # 1) Coletar dados da listagem
-        page_lista = context.new_page()
-        itens = coletar_da_listagem(page_lista, MAX_LINKS)
-        page_lista.close()
-
-        if not itens:
-            print("❌ Nenhum link coletado. Encerrando.")
-            browser.close()
-            return
-
-        # 2) Enriquecer cada anúncio (abrindo página individual)
-        anuncios = []
-        falhas   = 0
-        fallbacks = 0  # usou dados da listagem por bloqueio
-
-        for i, item in enumerate(itens, 1):
-            link = item.get("link", "")
-            print(f"\n  [{i}/{len(itens)}] {link[:80]}")
-            page = context.new_page()
-            dados = enriquecer_anuncio(page, item)
-            page.close()
-
-            if dados:
-                # Validação mínima: deve ter preço
-                if dados["preco"] > 0:
-                    anuncios.append(dados)
-                    print(f"    ✅ {dados['titulo'][:50]} | R${dados['preco']} | {dados['area']}m² | {dados['quartos']}q")
-                else:
-                    # Tentar aproveitar preço da listagem
-                    if item.get("preco", 0) > 0:
-                        dados["preco"] = item["preco"]
-                        anuncios.append(dados)
-                        fallbacks += 1
-                        print(f"    🔄 Preço da listagem: R${dados['preco']} | {dados['titulo'][:40]}")
-                    else:
-                        falhas += 1
-                        print(f"    ⛔ Sem preço — descartado ({falhas} descartados)")
-            else:
-                falhas += 1
-                print(f"    ⛔ Sem dados — descartado ({falhas} descartados)")
-
+        page = context.new_page()
+        itens = coletar_da_listagem(page, MAX_LINKS)
+        page.close()
         browser.close()
 
-    print(f"\n✅ Extraídos: {len(anuncios)} | Fallbacks da listagem: {fallbacks} | Descartados: {falhas}")
-    salvar_csv(anuncios, OUTPUT_FILE)
+    if not itens:
+        print("❌ Nenhum anúncio coletado.")
+        return
+
+    # Montar registros e mostrar diagnóstico
+    sem_preco  = 0
+    sem_area   = 0
+    registros  = []
+    for item in itens:
+        r = montar_registro(item)
+        registros.append(r)
+        if r["preco"] == 0:
+            sem_preco += 1
+        if r["area"] == 0:
+            sem_area += 1
+        print(
+            f"  {'✅' if r['preco'] > 0 else '⚠️ '} {r['titulo'][:50]:<50} | "
+            f"R${r['preco']:>9,.0f} | {r['area']:>5.0f}m² | {r['quartos']}q | {r['endereco'][:30]}"
+        )
+
+    print(f"\n📊 Total: {len(registros)} | Sem preço: {sem_preco} | Sem área: {sem_area}")
+    salvar_csv(registros, OUTPUT_FILE)
 
 
 if __name__ == "__main__":
