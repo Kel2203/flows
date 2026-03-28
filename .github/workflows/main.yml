@@ -8,7 +8,7 @@ on:
 jobs:
   scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
       MAX_LINKS:        "20"
@@ -23,41 +23,74 @@ jobs:
       - name: 📥 Checkout do repositório
         uses: actions/checkout@v4
 
+      # ── Python ────────────────────────────────────────────────────────────
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: 📦 Instalar dependências Python
-        run: pip install requests playwright
+        run: |
+          pip install --upgrade pip
+          pip install requests playwright
 
-      - name: 🌐 Instalar navegador Chromium
-        run: playwright install chromium --with-deps
+      # ── Chromium via Playwright ───────────────────────────────────────────
+      # Instalar com --with-deps garante todas as libs do SO necessárias
+      - name: 🌐 Instalar Chromium + dependências do sistema
+        run: |
+          playwright install chromium --with-deps
 
+      # ── Verificar que o Chromium está OK ─────────────────────────────────
+      - name: 🔧 Verificar instalação do Chromium
+        run: |
+          python -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True, args=['--no-sandbox'])
+              pg = b.new_page()
+              pg.goto('https://example.com', timeout=15000)
+              print('✅ Chromium OK:', pg.title())
+              b.close()
+          "
+
+      # ── Scraper ───────────────────────────────────────────────────────────
       - name: 🔍 Rodar scraper
+        # Timeout de 35min para dar margem ao workflow de 45min
+        timeout-minutes: 35
         run: python scraper_local.py
 
+      # ── Validar CSV ───────────────────────────────────────────────────────
       - name: 📊 Verificar CSV gerado
         id: check_csv
         run: |
-          if [ -f imoveis.csv ]; then
-            LINHAS=$(wc -l < imoveis.csv)
+          if [ -f "$CSV_FILE" ]; then
+            LINHAS=$(wc -l < "$CSV_FILE")
             echo "✅ CSV gerado com $LINHAS linhas"
-            head -3 imoveis.csv
-            echo "csv_exists=true" >> $GITHUB_OUTPUT
+            head -3 "$CSV_FILE"
+            if [ "$LINHAS" -gt 1 ]; then
+              echo "csv_exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ CSV existe mas está vazio (só cabeçalho)"
+              echo "csv_exists=false" >> $GITHUB_OUTPUT
+            fi
           else
             echo "⚠️ CSV não gerado"
             echo "csv_exists=false" >> $GITHUB_OUTPUT
           fi
 
+      # ── Upload Databricks ─────────────────────────────────────────────────
       - name: 📤 Upload para Databricks
         if: steps.check_csv.outputs.csv_exists == 'true'
         run: python upload_databricks.py
 
+      # ── Avisos ────────────────────────────────────────────────────────────
       - name: ⚠️ Avisar se sem dados
         if: steps.check_csv.outputs.csv_exists == 'false'
-        run: echo "::warning::Scraper não coletou dados nesta rodada"
+        run: |
+          echo "::warning::Scraper não coletou dados nesta rodada"
+          # Não falha o job — pode ser bloqueio temporário do OLX
 
+      # ── Artefato ──────────────────────────────────────────────────────────
       - name: 🗂️ Salvar CSV como artefato
         if: always()
         uses: actions/upload-artifact@v4
@@ -65,4 +98,4 @@ jobs:
           name: imoveis-${{ github.run_id }}
           path: imoveis.csv
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 7
