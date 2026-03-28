@@ -174,7 +174,11 @@ def coletar_da_listagem(page, max_links: int) -> list[dict]:
 
 
 def _extrair_next_data(page) -> list[dict]:
-    """Extrai anúncios do JSON __NEXT_DATA__ embutido pelo Next.js."""
+    """
+    Extrai anúncios de .props.pageProps.ads no __NEXT_DATA__ do OLX.
+    Campos confirmados: subject, priceValue, oldPrice, friendlyUrl, location.
+    Área e quartos vêm do subject (título), pois não há campo separado na listagem.
+    """
     try:
         raw = page.evaluate("""
         () => {
@@ -187,93 +191,96 @@ def _extrair_next_data(page) -> list[dict]:
 
         data = json.loads(raw)
 
-        # Navegar pela estrutura do Next.js para achar os anúncios
-        # A estrutura pode variar; tentamos caminhos comuns
-        ads = []
-        def buscar_lista(obj, depth=0):
-            if depth > 8 or not isinstance(obj, (dict, list)):
-                return
-            if isinstance(obj, list):
-                # Lista com dicts que têm 'url' e 'price' = provavelmente anúncios
-                if obj and isinstance(obj[0], dict) and ('url' in obj[0] or 'link' in obj[0]):
-                    ads.extend(obj)
-                    return
-                for item in obj:
-                    buscar_lista(item, depth + 1)
-            elif isinstance(obj, dict):
-                for key in ['adList', 'ads', 'listings', 'items', 'results', 'data']:
-                    if key in obj and isinstance(obj[key], list) and obj[key]:
-                        ads.extend(obj[key])
-                        return
-                for v in obj.values():
-                    buscar_lista(v, depth + 1)
+        # Caminho confirmado: .props.pageProps.ads
+        ads = (
+            data.get("props", {})
+                .get("pageProps", {})
+                .get("ads", [])
+        )
 
-        buscar_lista(data)
+        # Fallback: busca genérica se o caminho mudar no futuro
+        if not ads:
+            def buscar_ads(obj, depth=0):
+                if depth > 6 or not isinstance(obj, (dict, list)):
+                    return []
+                if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                    if "subject" in obj[0] and "priceValue" in obj[0]:
+                        return obj
+                if isinstance(obj, dict):
+                    for k in ["ads", "adList", "listings", "results"]:
+                        if k in obj and isinstance(obj[k], list) and obj[k]:
+                            found = buscar_ads(obj[k], depth + 1)
+                            if found:
+                                return found
+                    for v in obj.values():
+                        found = buscar_ads(v, depth + 1)
+                        if found:
+                            return found
+                return []
+            ads = buscar_ads(data)
 
         if not ads:
+            print("  [DEBUG] Nenhum anúncio encontrado no __NEXT_DATA__")
             return []
 
         resultado = []
         for ad in ads:
             if not isinstance(ad, dict):
                 continue
-            link  = ad.get("url") or ad.get("link") or ad.get("href") or ""
+
+            # ── Link ────────────────────────────────────────────────────────
+            link = ad.get("friendlyUrl") or ad.get("url") or ad.get("link") or ""
             if not link or "olx.com.br" not in link:
                 continue
 
-            titulo = ad.get("title") or ad.get("subject") or ""
-            preco  = 0.0
-            # Preço pode estar em sub-dicts
-            preco_raw = (
-                ad.get("price") or
-                ad.get("priceValue") or
-                (ad.get("priceInfo") or {}).get("value") or
-                ""
-            )
-            if preco_raw:
-                preco = float(re.sub(r"[^\d]", "", str(preco_raw)) or 0)
+            # ── Título ──────────────────────────────────────────────────────
+            titulo = ad.get("subject") or ad.get("title") or ""
 
-            endereco_raw = (
-                ad.get("location") or
-                (ad.get("locationInfo") or {}).get("neighbourhood") or
-                ad.get("neighbourhood") or
-                ""
-            )
-            endereco = str(endereco_raw).strip() if endereco_raw else ""
+            # ── Preço ───────────────────────────────────────────────────────
+            # priceValue vem como "R$ 335.000" — remover tudo que não for dígito
+            preco_raw = ad.get("priceValue") or ""
+            preco = float(re.sub(r"[^\d]", "", str(preco_raw)) or 0)
 
-            # Área e quartos de propriedades do anúncio
-            area    = 0.0
-            quartos = 0
-            for prop in ad.get("properties") or []:
-                if not isinstance(prop, dict):
-                    continue
-                nome = str(prop.get("name") or prop.get("label") or "").lower()
-                val  = str(prop.get("value") or "")
-                if "area" in nome or "m²" in nome:
-                    try:
-                        area = float(re.sub(r"[^\d.,]", "", val).replace(",", ".") or 0)
-                    except Exception:
-                        pass
-                if "quarto" in nome or "dorm" in nome:
-                    try:
-                        quartos = int(re.sub(r"[^\d]", "", val) or 0)
-                    except Exception:
-                        pass
+            # Preço anterior (quando há queda de preço)
+            old_raw = ad.get("oldPrice") or ""
+            preco_anterior = float(re.sub(r"[^\d]", "", str(old_raw)) or 0)
 
-            # Fallback: extrair do título
-            if not area:
-                area = extrair_area_titulo(titulo)
-            if not quartos:
-                quartos = extrair_quartos_titulo(titulo)
+            # ── Endereço ────────────────────────────────────────────────────
+            # location é um dict com neighbourhood, municipality, state
+            loc = ad.get("location") or {}
+            if isinstance(loc, dict):
+                bairro    = loc.get("neighbourhood") or loc.get("neighborhood") or ""
+                municipio = loc.get("municipality") or loc.get("city") or ""
+                estado    = loc.get("uf") or loc.get("state") or ""
+                partes = [p for p in [bairro, municipio] if p]
+                endereco = ", ".join(partes)
+                if estado and estado.upper() not in endereco.upper():
+                    endereco = f"{endereco}, {estado}" if endereco else estado
+            else:
+                endereco = str(loc).strip()
+
+            if not endereco:
+                endereco = normalizar_endereco(extrair_endereco_texto(titulo))
+            else:
+                endereco = normalizar_endereco(endereco)
+
+            # ── Área e Quartos ───────────────────────────────────────────────
+            # Não há campos separados na listagem — extrair do título
+            # Padrões comuns no OLX:
+            #   "52 metros quadrados com 2 quartos"
+            #   "Apartamento com 40m², 2 quartos"
+            #   "LINDO APARTAMENTO 3 DORMITÓRIOS 94 M²"
+            area    = extrair_area(titulo) or extrair_area_titulo(titulo)
+            quartos = extrair_quartos(titulo) or extrair_quartos_titulo(titulo)
 
             resultado.append({
                 "link":           link,
                 "titulo":         titulo,
                 "preco":          preco,
-                "endereco":       normalizar_endereco(endereco),
+                "preco_anterior": preco_anterior,
+                "endereco":       endereco,
                 "area":           area,
                 "quartos":        quartos,
-                "preco_anterior": 0.0,
             })
 
         return resultado
