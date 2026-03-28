@@ -2,7 +2,7 @@ name: Scraper Imóveis → Databricks
 
 on:
   schedule:
-    - cron: "0 10,16,21,2 * * *"
+    - cron: "0 12,0 * * *"
   workflow_dispatch:
 
 jobs:
