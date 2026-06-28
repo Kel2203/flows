@@ -42,36 +42,50 @@ def executar_sql(statement: str, parametros: list = None) -> dict:
     """Executa um SQL statement via Databricks SQL API e aguarda conclusão."""
     body = {
         "warehouse_id": WAREHOUSE_ID,
-        "statement":    statement,
+        "statement": statement,
         "wait_timeout": "30s",
         "on_wait_timeout": "CONTINUE",
     }
+
     if parametros:
         body["parameters"] = parametros
 
-    resp = requests.post(SQL_API, headers=HEADERS, json=body, timeout=60)
-    if not resp.ok:
-    print(resp.status_code)
-    print(resp.text)
+    resp = requests.post(
+        SQL_API,
+        headers=HEADERS,
+        json=body,
+        timeout=60
+    )
+
+    print("Status:", resp.status_code)
+    print("Resposta:", resp.text)
+
     resp.raise_for_status()
+
     result = resp.json()
 
     # Polling enquanto estiver rodando
     statement_id = result.get("statement_id")
+
     while result.get("status", {}).get("state") in ("PENDING", "RUNNING"):
         time.sleep(2)
+
         poll = requests.get(
             f"{SQL_API}/{statement_id}",
             headers=HEADERS,
             timeout=30
         )
+
         poll.raise_for_status()
         result = poll.json()
 
     state = result.get("status", {}).get("state")
+
     if state != "SUCCEEDED":
         erro = result.get("status", {}).get("error", {})
-        raise RuntimeError(f"SQL falhou ({state}): {erro.get('message', '')}")
+        raise RuntimeError(
+            f"SQL falhou ({state}): {erro.get('message', '')}"
+        )
 
     return result
 
