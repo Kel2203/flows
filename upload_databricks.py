@@ -19,13 +19,23 @@ CATALOG          = os.environ.get("CATALOG", "workspace")
 SCHEMA           = os.environ.get("SCHEMA",  "imoveis")
 TABLE            = f"{CATALOG}.{SCHEMA}.imoveis_raw"
 CSV_FILE         = os.environ.get("CSV_FILE", "imoveis.csv")
+print("Host:", DATABRICKS_HOST)
+print("Warehouse:", WAREHOUSE_ID)
+print("Token começa com:", DATABRICKS_TOKEN[:10])
 
 HEADERS = {
     "Authorization": f"Bearer {DATABRICKS_TOKEN}",
     "Content-Type":  "application/json",
 }
+r = requests.get(
+    f"{DATABRICKS_HOST}/api/2.0/current-user/me",
+    headers=HEADERS,
+)
 
+print(r.status_code)
+print(r.text)
 SQL_API = f"{DATABRICKS_HOST}/api/2.0/sql/statements"
+
 
 
 def executar_sql(statement: str, parametros: list = None) -> dict:
@@ -40,6 +50,9 @@ def executar_sql(statement: str, parametros: list = None) -> dict:
         body["parameters"] = parametros
 
     resp = requests.post(SQL_API, headers=HEADERS, json=body, timeout=60)
+    if not resp.ok:
+    print(resp.status_code)
+    print(resp.text)
     resp.raise_for_status()
     result = resp.json()
 
